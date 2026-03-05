@@ -60,7 +60,6 @@ app.use("/api/auth/login", loginLimiter);
 app.use(
   cors({
     origin: "*",
-    credentials: true,
   }),
 );
 
