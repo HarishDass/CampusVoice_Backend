@@ -60,21 +60,40 @@ async function createIssue(req, res) {
   }
 }
 
+// ─── GET /api/issues — paginated ─────────────────────────────────────────────
+// Query params: page, limit, status
 async function getIssues(req, res) {
   const studentId = new mongoose.Types.ObjectId(req.user.id);
   const isAdmin = req.user.role === "admin";
-  try {
-    const issues = isAdmin
-      ? await Issue.find({})
-          .populate("createdBy", "name email")
-          .populate("assignedTo", "name email")
-          .sort({ createdAt: -1 })
-      : await Issue.find({ createdBy: studentId })
-          .populate("createdBy", "name email")
-          .populate("assignedTo", "name email")
-          .sort({ createdAt: -1 });
 
-    return res.json(issues);
+  const page = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
+  const skip = (page - 1) * limit;
+
+  try {
+    // Build filter
+    const filter = isAdmin ? {} : { createdBy: studentId };
+    // Optional status filter (used by EscalatedIssues passing status=escalated)
+    if (req.query.status) {
+      filter.status = req.query.status;
+    }
+
+    const [issues, total] = await Promise.all([
+      Issue.find(filter)
+        .populate("createdBy", "name email")
+        .populate("assignedTo", "name email")
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit),
+      Issue.countDocuments(filter),
+    ]);
+
+    return res.json({
+      issues,
+      total,
+      page,
+      totalPages: Math.ceil(total / limit),
+    });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: "Server error" });
@@ -140,8 +159,6 @@ async function getIssueStats(req, res) {
 }
 
 // ─── STUDENT: Notifications ───────────────────────────────────────────────────
-// GET /api/issues/notifications?limit=4
-// Returns status-change workLogs on the student's own issues as "notifications"
 async function getStudentNotifications(req, res) {
   try {
     const studentId = new mongoose.Types.ObjectId(req.user.id);
@@ -153,11 +170,9 @@ async function getStudentNotifications(req, res) {
       .sort({ updatedAt: -1 })
       .lean();
 
-    // Flatten workLogs into notification-shaped objects, newest first
     const notifications = [];
     for (const issue of issues) {
       for (const log of [...(issue.workLogs || [])].reverse()) {
-        // Only surface status/resolution logs as notifications
         if (
           ["status_change", "resolution", "escalation", "system"].includes(
             log.type,
@@ -170,16 +185,15 @@ async function getStudentNotifications(req, res) {
           notifications.push({
             _id: log._id,
             message: `"${issue.title}" — ${log.message}`,
-            read: false, // extend with a Notification model if needed
+            read: false,
             issueId: issue._id,
             createdAt: log.createdAt,
           });
         }
       }
-      if (notifications.length >= limit * 3) break; // early exit before sort
+      if (notifications.length >= limit * 3) break;
     }
 
-    // Sort all collected notifications by date desc, take limit
     notifications.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
     return res.json(notifications.slice(0, limit));
@@ -190,8 +204,6 @@ async function getStudentNotifications(req, res) {
 }
 
 // ─── STUDENT: Activity Timeline ───────────────────────────────────────────────
-// GET /api/issues/timeline?limit=5
-// Returns the most recent workLog entries across all of the student's issues
 async function getStudentTimeline(req, res) {
   try {
     const studentId = new mongoose.Types.ObjectId(req.user.id);
@@ -211,7 +223,7 @@ async function getStudentTimeline(req, res) {
           action: log.message,
           issueTitle: issue.title,
           issueId: issue._id,
-          type: issue.status, // used for dot colour in the UI
+          type: issue.status,
           createdAt: log.createdAt,
         });
       }
@@ -227,7 +239,6 @@ async function getStudentTimeline(req, res) {
 }
 
 // ─── STAFF: Dashboard Stats ───────────────────────────────────────────────────
-// GET /api/issues/staff/dashboard-stats
 async function getStaffDashboardStats(req, res) {
   try {
     const staffId = new mongoose.Types.ObjectId(req.user.id);
@@ -279,28 +290,46 @@ async function getStaffDashboardStats(req, res) {
   }
 }
 
-// ─── STAFF: All Assigned Grievances (with filters) ────────────────────────────
-// GET /api/issues/staff/assigned?status=&priority=&sort=-createdAt&limit=5
+// ─── STAFF: Assigned Grievances — paginated ───────────────────────────────────
+// GET /api/issues/staff/assigned?status=&priority=&sort=-createdAt&page=1&limit=10
 async function getAssignedGrievances(req, res) {
   try {
     const staffId = req.user.id;
-    const { status, priority, sort = "-createdAt", limit } = req.query;
+    const {
+      status,
+      priority,
+      sort = "-createdAt",
+      page: pageParam,
+      limit: limitParam,
+    } = req.query;
+
+    const page = Math.max(1, parseInt(pageParam) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(limitParam) || 10));
+    const skip = (page - 1) * limit;
 
     const query = { assignedTo: staffId };
     if (status) query.status = status;
     if (priority) query.priority = priority;
 
-    let q = Issue.find(query)
-      .select(
-        "title description progress category priority status createdAt studentName createdBy",
-      )
-      .populate("createdBy", "name email")
-      .sort(sort);
+    const [grievances, total] = await Promise.all([
+      Issue.find(query)
+        .select(
+          "title description progress category priority status createdAt studentName createdBy",
+        )
+        .populate("createdBy", "name email")
+        .sort(sort)
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Issue.countDocuments(query),
+    ]);
 
-    if (limit) q = q.limit(parseInt(limit));
-
-    const grievances = await q.lean();
-    return res.json(grievances);
+    return res.json({
+      issues: grievances,
+      total,
+      page,
+      totalPages: Math.ceil(total / limit),
+    });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: "Server error" });
@@ -308,7 +337,6 @@ async function getAssignedGrievances(req, res) {
 }
 
 // ─── STAFF: Escalated Issues ──────────────────────────────────────────────────
-// GET /api/issues/staff/escalated
 async function getEscalatedIssues(req, res) {
   try {
     const staffId = new mongoose.Types.ObjectId(req.user.id);
@@ -330,9 +358,6 @@ async function getEscalatedIssues(req, res) {
 }
 
 // ─── STAFF: Department Stats ──────────────────────────────────────────────────
-// GET /api/issues/staff/departments
-// Groups ALL issues by category (acts as "department" proxy).
-// If your Issue model has a `department` field, swap $category → $department.
 async function getDepartmentStats(req, res) {
   try {
     const deptStats = await Issue.aggregate([
@@ -362,8 +387,6 @@ async function getDepartmentStats(req, res) {
 }
 
 // ─── STAFF: Recent Activity Feed ─────────────────────────────────────────────
-// GET /api/issues/staff/activity?limit=4
-// Returns the latest workLog entries on issues assigned to this staff member
 async function getStaffActivity(req, res) {
   try {
     const staffId = new mongoose.Types.ObjectId(req.user.id);
@@ -373,7 +396,7 @@ async function getStaffActivity(req, res) {
       .select("title workLogs")
       .populate("workLogs.updatedBy", "name")
       .sort({ updatedAt: -1 })
-      .limit(20) // fetch more issues than needed so we can collect enough logs
+      .limit(20)
       .lean();
 
     const activity = [];
@@ -641,7 +664,6 @@ module.exports = {
   getAssignedGrievances,
   resolveIssue,
   getGrievanceById,
-  // new
   getStudentNotifications,
   getStudentTimeline,
   getEscalatedIssues,
