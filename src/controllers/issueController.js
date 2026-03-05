@@ -360,7 +360,14 @@ async function getEscalatedIssues(req, res) {
 // ─── STAFF: Department Stats ──────────────────────────────────────────────────
 async function getDepartmentStats(req, res) {
   try {
+    const staffId = req.user.id; // from auth middleware
+
     const deptStats = await Issue.aggregate([
+      {
+        $match: {
+          assignedTo: new mongoose.Types.ObjectId(staffId), // filter by staff
+        },
+      },
       {
         $group: {
           _id: "$category",
