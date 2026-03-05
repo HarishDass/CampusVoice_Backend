@@ -16,6 +16,8 @@ const issueRoutes = require("./src/routes/issues");
 const staffRoutes = require("./src/routes/staffs");
 const commentRoutes = require("./src/routes/comment");
 const adminRoutes = require("./src/routes/admin");
+const userRoutes = require("./src/routes/user");
+
 
 const app = express();
 
@@ -28,6 +30,7 @@ app.use("/api/issues", issueRoutes);
 app.use("/api/staffs", staffRoutes);
 app.use("/api/comment", commentRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/admin/users", userRoutes);
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
 const MONGO_URL =

@@ -15,4 +15,14 @@ function authMiddleware(req, res, next) {
   }
 }
 
+function authorizeAdmin(req, res, next) {
+  if (req.user?.role !== 'admin')
+    return res.status(403).json({ message: 'Admin access required' });
+  next();
+}
+
+// Default export stays the same → existing routes keep working without any changes
 module.exports = authMiddleware;
+
+// Named export for new admin routes
+module.exports.authorizeAdmin = authorizeAdmin;
