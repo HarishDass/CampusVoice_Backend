@@ -84,7 +84,8 @@ app.use((err, req, res, next) => {
   });
 });
 
-const MONGO_URL = process.env.MONGO_URL;
+const MONGO_URL =
+  "mongodb+srv://HarishDass:AlQ1gMyxD2UEoLLE@cluster0.zpcjhcf.mongodb.net/?appName=Cluster0";
 const PORT = process.env.PORT || 4000;
 
 mongoose
