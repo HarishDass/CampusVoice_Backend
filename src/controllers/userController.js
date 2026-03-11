@@ -1,8 +1,8 @@
 const bcrypt = require("bcryptjs");
 const User = require("../models/User");
+const Issue = require("../models/Issue");
 
 // ─── GET /api/admin/users ─────────────────────────────────────────────────────
-// Query params: role, search, page, limit, sort, order
 async function getUsers(req, res) {
   try {
     const {
@@ -16,12 +16,10 @@ async function getUsers(req, res) {
 
     const filter = {};
 
-    // Role filter
     if (role && ["student", "staff", "admin"].includes(role)) {
       filter.role = role;
     }
 
-    // Search by name or email (case-insensitive)
     if (search && search.trim()) {
       filter.$or = [
         { name: { $regex: search.trim(), $options: "i" } },
@@ -34,8 +32,13 @@ async function getUsers(req, res) {
     const skip = (pageNum - 1) * limitNum;
     const sortOrder = order === "asc" ? 1 : -1;
 
-    // Only allow sorting by safe fields
-    const allowedSortFields = ["name", "email", "role", "createdAt", "updatedAt"];
+    const allowedSortFields = [
+      "name",
+      "email",
+      "role",
+      "createdAt",
+      "updatedAt",
+    ];
     const sortField = allowedSortFields.includes(sort) ? sort : "createdAt";
 
     const [users, total] = await Promise.all([
@@ -76,9 +79,167 @@ async function getUserById(req, res) {
   }
 }
 
+// ─── GET /api/admin/users/:id/activity ───────────────────────────────────────
+// Returns the full activity timeline + summary stats for one user.
+// Works with the Issue schema: createdBy, workLogs[{ type, message, updatedBy }]
+// Role-aware: students see only their own submitted issues;
+//             staff see issues assigned to them as well.
+async function getUserActivity(req, res) {
+  try {
+    const { id } = req.params;
+
+    const user = await User.findById(id).select("_id name email role").lean();
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    // ── Build query based on role ─────────────────────────────────────────────
+    // Students: only issues they created
+    // Staff / Admin: issues they created OR were assigned to handle
+    let issueQuery;
+    if (user.role === "student") {
+      issueQuery = { createdBy: id };
+    } else {
+      issueQuery = { $or: [{ createdBy: id }, { assignedTo: id }] };
+    }
+
+    const issues = await Issue.find(issueQuery)
+      .sort({ createdAt: -1 })
+      .select(
+        "_id title description status priority category progress createdBy assignedTo createdAt updatedAt workLogs",
+      )
+      .lean();
+
+    const events = [];
+    // Count workLog entries where this user wrote a comment
+    let totalComments = 0;
+
+    for (const issue of issues) {
+      const isOwner = issue.createdBy?.toString() === id.toString();
+      const isAssigned = issue.assignedTo?.toString() === id.toString();
+
+      // ── 1. Submission event (only for issues the user created) ─────────────
+      if (isOwner) {
+        events.push({
+          _id: `submit-${issue._id}`,
+          type: "issue_submitted",
+          title: `Submitted: ${issue.title}`,
+          description: issue.description
+            ? issue.description.slice(0, 140) +
+              (issue.description.length > 140 ? "…" : "")
+            : undefined,
+          issueId: issue._id,
+          createdAt: issue.createdAt,
+          meta: {
+            priority: issue.priority,
+            category: issue.category,
+          },
+        });
+      }
+
+      // ── 2. Assignment event (staff/admin only) ─────────────────────────────
+      if (isAssigned && !isOwner) {
+        events.push({
+          _id: `assign-${issue._id}`,
+          type: "status_changed",
+          title: `Assigned to handle: ${issue.title}`,
+          issueId: issue._id,
+          createdAt: issue.createdAt,
+          meta: { priority: issue.priority, category: issue.category },
+        });
+      }
+
+      // ── 3. Terminal-state events (resolved / escalated / closed / denied) ──
+      const terminalMap = {
+        resolved: { evtType: "issue_resolved", label: "Issue resolved" },
+        escalated: { evtType: "issue_escalated", label: "Issue escalated" },
+        closed: { evtType: "status_changed", label: "Issue closed" },
+        denied: { evtType: "status_changed", label: "Issue denied" },
+      };
+      if (terminalMap[issue.status]) {
+        const { evtType, label } = terminalMap[issue.status];
+        events.push({
+          _id: `${issue.status}-${issue._id}`,
+          type: evtType,
+          title: `${label}: ${issue.title}`,
+          issueId: issue._id,
+          createdAt: issue.updatedAt,
+          meta: { priority: issue.priority },
+        });
+      }
+
+      // ── 4. workLogs — use the schema's own `type` field directly ──────────
+      // Map Issue workLog types → frontend activity event types
+      const typeMap = {
+        comment: "comment_added",
+        status_change: "status_changed",
+        progress_update: "status_changed",
+        resolution: "issue_resolved",
+        priority_change: "status_changed",
+        reassignment: "status_changed",
+        escalation: "issue_escalated",
+        system: "status_changed",
+      };
+
+      if (Array.isArray(issue.workLogs)) {
+        for (const log of issue.workLogs) {
+          // Only include logs that this user wrote
+          if (log.updatedBy?.toString() !== id.toString()) continue;
+
+          const evtType = typeMap[log.type] ?? "status_changed";
+          if (log.type === "comment") totalComments++;
+
+          events.push({
+            _id: `wl-${issue._id}-${log._id}`,
+            type: evtType,
+            title: log.type === "comment" ? "Added a comment" : log.message,
+            description:
+              log.type === "comment"
+                ? log.message.slice(0, 140) +
+                  (log.message.length > 140 ? "…" : "")
+                : undefined,
+            issueId: issue._id,
+            createdAt: log.createdAt,
+            meta: {
+              issue: issue.title.slice(0, 40),
+              logType: log.type,
+            },
+          });
+        }
+      }
+    }
+
+    // Sort newest-first
+    events.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+    // ── Summary stats ─────────────────────────────────────────────────────────
+    const submittedIssues = issues.filter(
+      (i) => i.createdBy?.toString() === id.toString(),
+    );
+    const stats = {
+      totalIssues: submittedIssues.length,
+      resolved: submittedIssues.filter((i) => i.status === "resolved").length,
+      // Count only workLog comments written by this user (not all comments on the issue)
+      comments: issues.reduce((sum, issue) => {
+        if (!Array.isArray(issue.workLogs)) return sum;
+        return (
+          sum +
+          issue.workLogs.filter(
+            (log) =>
+              log.type === "comment" &&
+              log.updatedBy?.toString() === id.toString(),
+          ).length
+        );
+      }, 0),
+      lastActive: events.length > 0 ? events[0].createdAt : null,
+    };
+
+    return res.json({ events, stats });
+  } catch (err) {
+    console.error("getUserActivity error:", err);
+    return res.status(500).json({ message: "Server error" });
+  }
+}
+
 // ─── POST /api/admin/users ────────────────────────────────────────────────────
-// Body: { name?, email, password, role? }
-// Same logic as your existing register controller but called by admin
 async function createUser(req, res) {
   const { name, email, password, role } = req.body;
 
@@ -86,10 +247,14 @@ async function createUser(req, res) {
     return res.status(400).json({ message: "Email and password are required" });
 
   if (password.length < 6)
-    return res.status(400).json({ message: "Password must be at least 6 characters" });
+    return res
+      .status(400)
+      .json({ message: "Password must be at least 6 characters" });
 
   if (role && !["student", "staff", "admin"].includes(role))
-    return res.status(400).json({ message: "Role must be student, staff, or admin" });
+    return res
+      .status(400)
+      .json({ message: "Role must be student, staff, or admin" });
 
   try {
     const existing = await User.findOne({ email: email.toLowerCase().trim() });
@@ -118,9 +283,6 @@ async function createUser(req, res) {
 }
 
 // ─── POST /api/admin/users/bulk ───────────────────────────────────────────────
-// Body: { users: [{ name?, email, password, role? }] }
-// Processes every row independently — never aborts on a single failure.
-// Returns: { imported, failed, results: [{ row, email, success, error?, userId? }] }
 async function bulkCreateUsers(req, res) {
   const { users } = req.body;
 
@@ -128,7 +290,9 @@ async function bulkCreateUsers(req, res) {
     return res.status(400).json({ message: "Provide a non-empty users array" });
 
   if (users.length > 500)
-    return res.status(400).json({ message: "Maximum 500 users per bulk import" });
+    return res
+      .status(400)
+      .json({ message: "Maximum 500 users per bulk import" });
 
   const results = [];
   let imported = 0;
@@ -138,37 +302,62 @@ async function bulkCreateUsers(req, res) {
     const { name, email, password, role } = users[i];
     const row = i + 1;
 
-    // ── Row-level validation ──────────────────────────────────────────────────
     if (!email || !password) {
-      results.push({ row, email: email ?? "", success: false, error: "Email and password are required" });
+      results.push({
+        row,
+        email: email ?? "",
+        success: false,
+        error: "Email and password are required",
+      });
       failed++;
       continue;
     }
 
     if (password.length < 6) {
-      results.push({ row, email, success: false, error: "Password must be ≥ 6 characters" });
+      results.push({
+        row,
+        email,
+        success: false,
+        error: "Password must be ≥ 6 characters",
+      });
       failed++;
       continue;
     }
 
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(email)) {
-      results.push({ row, email, success: false, error: "Invalid email format" });
+      results.push({
+        row,
+        email,
+        success: false,
+        error: "Invalid email format",
+      });
       failed++;
       continue;
     }
 
     if (role && !["student", "staff", "admin"].includes(role)) {
-      results.push({ row, email, success: false, error: "Role must be student, staff, or admin" });
+      results.push({
+        row,
+        email,
+        success: false,
+        error: "Role must be student, staff, or admin",
+      });
       failed++;
       continue;
     }
 
-    // ── DB operation ──────────────────────────────────────────────────────────
     try {
-      const existing = await User.findOne({ email: email.toLowerCase().trim() });
+      const existing = await User.findOne({
+        email: email.toLowerCase().trim(),
+      });
       if (existing) {
-        results.push({ row, email, success: false, error: "Email already in use" });
+        results.push({
+          row,
+          email,
+          success: false,
+          error: "Email already in use",
+        });
         failed++;
         continue;
       }
@@ -194,7 +383,6 @@ async function bulkCreateUsers(req, res) {
 }
 
 // ─── PUT /api/admin/users/:id ─────────────────────────────────────────────────
-// Body: { name?, email?, role? }  — password intentionally excluded here
 async function updateUser(req, res) {
   try {
     const { name, email, role } = req.body;
@@ -207,7 +395,6 @@ async function updateUser(req, res) {
       if (!emailRegex.test(email))
         return res.status(400).json({ message: "Invalid email format" });
 
-      // Make sure new email isn't taken by another user
       const conflict = await User.findOne({
         email: email.toLowerCase().trim(),
         _id: { $ne: req.params.id },
@@ -227,7 +414,7 @@ async function updateUser(req, res) {
     const user = await User.findByIdAndUpdate(
       req.params.id,
       { $set: updates },
-      { new: true, runValidators: true }
+      { new: true, runValidators: true },
     ).select("-password -refreshToken");
 
     if (!user) return res.status(404).json({ message: "User not found" });
@@ -242,9 +429,10 @@ async function updateUser(req, res) {
 // ─── DELETE /api/admin/users/:id ──────────────────────────────────────────────
 async function deleteUser(req, res) {
   try {
-    // Prevent admin from deleting themselves
     if (req.params.id === req.user?.id)
-      return res.status(400).json({ message: "You cannot delete your own account" });
+      return res
+        .status(400)
+        .json({ message: "You cannot delete your own account" });
 
     const user = await User.findByIdAndDelete(req.params.id);
     if (!user) return res.status(404).json({ message: "User not found" });
@@ -259,6 +447,7 @@ async function deleteUser(req, res) {
 module.exports = {
   getUsers,
   getUserById,
+  getUserActivity, // ← NEW
   createUser,
   bulkCreateUsers,
   updateUser,

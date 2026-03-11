@@ -8,6 +8,7 @@ const {
   createUser,
   bulkCreateUsers,
   updateUser,
+  getUserActivity,
   deleteUser,
 } = require("../controllers/userController");
 
@@ -22,6 +23,7 @@ router.route("/").get(getUsers).post(createUser);
 // POST /api/admin/users/bulk  — bulk create
 // Must come BEFORE /:id so "bulk" isn't treated as a Mongo _id
 router.post("/bulk", bulkCreateUsers);
+router.get("/:id/activity", getUserActivity);
 
 // GET    /api/admin/users/:id
 // PUT    /api/admin/users/:id
