@@ -360,7 +360,7 @@ async function getRecentIssues(req, res) {
       else timeAgo = `${daysAgo} day${daysAgo > 1 ? "s" : ""} ago`;
 
       return {
-        id: `GRV${issue._id.toString().slice(-5).toUpperCase()}`,
+        id: issue._id,
         title: issue.title,
         priority:
           issue.priority.charAt(0).toUpperCase() + issue.priority.slice(1),
